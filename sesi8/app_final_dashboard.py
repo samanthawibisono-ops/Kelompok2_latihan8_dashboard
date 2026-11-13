@@ -21,12 +21,13 @@ from utils.model_utils import load_metadata, load_model, predict, validate_input
 MODEL_DIR = Path(__file__).resolve().parent / "top3_models_cv_roc_auc"
 REGISTRY = json.loads((MODEL_DIR / "top_models_registry.json").read_text(encoding="utf-8"))
 MODEL_CONFIGS = {item["key"]: item for item in REGISTRY["models"]}
-MODEL_OPTIONS = [
+NO_MODEL = "none"
+MODEL_OPTIONS = [{"label": "Tanpa model — Data aktual", "value": NO_MODEL}] + [
     {"label": f"Model {chr(64 + item['rank'])} — {item['name']}", "value": item["key"]}
     for item in REGISTRY["models"]
 ]
 MODEL_LABELS = {option["value"]: option["label"] for option in MODEL_OPTIONS}
-DEFAULT_MODEL = "logreg_ros"
+DEFAULT_MODEL = NO_MODEL
 META = load_metadata(MODEL_DIR / "model_metadata.json")
 MODELS = {
     key: load_model(MODEL_DIR / item["file"])
@@ -36,16 +37,16 @@ raw = pd.read_csv(ROOT / "data" / "customer_churn.csv", parse_dates=["signup_dat
 raw["total_charges"] = raw["total_charges"].fillna(
     raw["monthly_charges"] * raw["tenure_months"]
 )
+raw["status"] = raw["churn"].map({0: "Bertahan", 1: "Churn"})
+raw["periode"] = raw["signup_date"].dt.to_period("Q").astype(str)
 DF_BY_MODEL = {}
 for model_key, model in MODELS.items():
-    predictions = predict(model, raw, META)
-    predictions["status"] = predictions["churn"].map({0: "Bertahan", 1: "Churn"})
-    predictions["periode"] = predictions["signup_date"].dt.to_period("Q").astype(str)
-    DF_BY_MODEL[model_key] = predictions
+    DF_BY_MODEL[model_key] = predict(model, raw, META)
 
 CATS = META["categories"]
 RISK_ORDER = ["Rendah", "Sedang", "Tinggi"]
 RISK_COLOR = {"Rendah": "#55A868", "Sedang": "#DD8452", "Tinggi": "#C44E52"}
+STATUS_COLOR = {"Bertahan": "#4C72B0", "Churn": "#C44E52"}
 TENURE_MIN = int(raw["tenure_months"].min())
 TENURE_MAX = int(raw["tenure_months"].max())
 
@@ -139,9 +140,15 @@ sidebar = html.Div(
             id="f-kontrak", options=CATS["contract_type"], value=CATS["contract_type"]
         ),
         html.Br(),
-        label("Kategori risiko (prediksi)"),
-        dcc.Checklist(id="f-risk", options=RISK_ORDER, value=RISK_ORDER, inline=True),
-        html.Br(),
+        html.Div(
+            id="risk-filter-container",
+            style={"display": "none"},
+            children=[
+                label("Kategori risiko (prediksi)"),
+                dcc.Checklist(id="f-risk", options=RISK_ORDER, value=RISK_ORDER, inline=True),
+                html.Br(),
+            ],
+        ),
         label("Tenure (bulan)"),
         dcc.RangeSlider(
             id="f-tenure",
@@ -164,18 +171,35 @@ TABLE_FIELDS = [
     ("Prob. churn", "churn_probability"),
     ("Risiko", "risk_category"),
 ]
-TABLE_COLUMNS = [
-    {
-        "name": name,
-        "id": field,
-        **(
-            {"type": "numeric", "format": {"specifier": ".1%"}}
-            if field == "churn_probability"
-            else {}
-        ),
-    }
-    for name, field in TABLE_FIELDS
+RAW_TABLE_FIELDS = [
+    ("ID", "customer_id"),
+    ("Region", "region"),
+    ("Segmen", "segment"),
+    ("Kontrak", "contract_type"),
+    ("Tenure", "tenure_months"),
+    ("Tagihan bulanan", "monthly_charges"),
+    ("Keluhan", "num_complaints"),
+    ("Status aktual", "status"),
 ]
+
+
+def table_columns(fields):
+    return [
+        {
+            "name": name,
+            "id": field,
+            **(
+                {"type": "numeric", "format": {"specifier": ".1%"}}
+                if field == "churn_probability"
+                else {}
+            ),
+        }
+        for name, field in fields
+    ]
+
+
+TABLE_COLUMNS = table_columns(TABLE_FIELDS)
+RAW_TABLE_COLUMNS = table_columns(RAW_TABLE_FIELDS)
 
 tab_overview = html.Div(
     [
@@ -200,7 +224,7 @@ tab_overview = html.Div(
                     page_size=10,
                     sort_action="native",
                     filter_action="native",
-                    columns=TABLE_COLUMNS,
+                    columns=RAW_TABLE_COLUMNS,
                     style_cell={"padding": "6px", "fontSize": "13px", "textAlign": "left"},
                     style_header={"fontWeight": "bold", "background": "#E9EDF5"},
                     style_data_conditional=[
@@ -252,6 +276,7 @@ tab_predict = html.Div(
                     "Jalankan prediksi",
                     id="btn-predict",
                     n_clicks=0,
+                    disabled=True,
                     style={
                         "background": COLOR["accent"],
                         "color": "white",
@@ -267,7 +292,10 @@ tab_predict = html.Div(
             style=CARD,
             children=[
                 html.H4("Hasil prediksi", style={"marginTop": 0}),
-                html.Div(id="pred-output", children=html.P("Isi form lalu klik tombol.")),
+                html.Div(
+                    id="pred-output",
+                    children=html.P("Pilih Model A, B, atau C untuk memprediksi pelanggan."),
+                ),
                 dcc.Graph(id="g-gauge", style={"height": "260px"}),
             ],
         ),
@@ -291,7 +319,7 @@ app.layout = html.Div(
                 html.H2("Customer Churn Intelligence Dashboard", style={"margin": 0}),
                 html.Div(
                     "Pertanyaan bisnis: pelanggan mana yang berisiko churn dan apa yang harus "
-                    "dilakukan? · Data latihan 2023–2025 · Prediksi dari model terpilih",
+                    "dilakukan? · Data latihan 2023–2025 · Analisis aktual dan prediksi model",
                     style={"color": COLOR["muted"]},
                 ),
             ],
@@ -308,7 +336,7 @@ app.layout = html.Div(
                             value="overview",
                             children=[
                                 dcc.Tab(
-                                    label="Overview & Risiko",
+                                    label="Overview Data",
                                     value="overview",
                                     children=[tab_overview],
                                 ),
@@ -327,27 +355,34 @@ app.layout = html.Div(
 )
 
 
-@app.callback(Output("model-info", "children"), Input("f-model", "value"))
+@app.callback(
+    Output("model-info", "children"),
+    Output("risk-filter-container", "style"),
+    Output("btn-predict", "disabled"),
+    Input("f-model", "value"),
+)
 def show_model_info(model_key):
+    if model_key == NO_MODEL:
+        return "Analisis churn aktual tanpa prediksi model.", {"display": "none"}, True
     if model_key not in MODEL_CONFIGS:
         raise PreventUpdate
     config = MODEL_CONFIGS[model_key]
-    return (
+    info = (
         f"CV ROC AUC {config['cv_roc_auc']['mean']:.4f} · "
         f"Recall uji {config['holdout_metrics']['recall']:.1%}"
     )
+    return info, {}, False
 
 
 def apply_filters(model_key, region, segment, kontrak, risk, tenure):
-    filtered = DF_BY_MODEL[model_key]
+    filtered = raw if model_key == NO_MODEL else DF_BY_MODEL[model_key]
     if region:
         filtered = filtered[filtered["region"].isin(region)]
     if segment:
         filtered = filtered[filtered["segment"].isin(segment)]
-    filtered = filtered[
-        filtered["contract_type"].isin(kontrak or [])
-        & filtered["risk_category"].isin(risk or [])
-    ]
+    filtered = filtered[filtered["contract_type"].isin(kontrak or [])]
+    if model_key != NO_MODEL:
+        filtered = filtered[filtered["risk_category"].isin(risk or [])]
     return filtered[filtered["tenure_months"].between(*tenure)]
 
 
@@ -361,6 +396,116 @@ FILTERS = [
 ]
 
 
+def actual_overview(filtered):
+    churn_count = int(filtered["churn"].sum())
+    kpis = [
+        kpi("Pelanggan", f"{len(filtered):,}", "sesuai filter"),
+        kpi("Churn rate aktual", f"{filtered['churn'].mean():.1%}"),
+        kpi("Pelanggan churn", f"{churn_count:,}"),
+        kpi("Rata-rata tagihan bulanan", rupiah(filtered["monthly_charges"].mean())),
+    ]
+
+    donut = px.pie(
+        filtered,
+        names="status",
+        hole=0.55,
+        color="status",
+        color_discrete_map=STATUS_COLOR,
+        title="Komposisi churn aktual",
+    )
+    donut.update_traces(textinfo="percent+label")
+
+    regional_churn = (
+        filtered.groupby("region", as_index=False)["churn"]
+        .mean()
+        .sort_values("churn")
+    )
+    region_chart = px.bar(
+        regional_churn,
+        x="churn",
+        y="region",
+        orientation="h",
+        text_auto=".1%",
+        template="plotly_white",
+        color_discrete_sequence=[STATUS_COLOR["Churn"]],
+        title="Churn rate aktual per region",
+        labels={"churn": "Churn rate aktual", "region": ""},
+    )
+    region_chart.update_xaxes(tickformat=".0%")
+
+    quarterly_churn = filtered.groupby("periode", as_index=False)["churn"].mean()
+    trend = px.line(
+        quarterly_churn,
+        x="periode",
+        y="churn",
+        markers=True,
+        template="plotly_white",
+        title="Churn rate aktual per kuartal pendaftaran",
+        labels={"periode": "Kuartal pendaftaran", "churn": "Churn rate"},
+    )
+    trend.update_yaxes(tickformat=".0%")
+
+    contract_data = (
+        filtered.groupby(["contract_type", "status"])
+        .size()
+        .reset_index(name="n")
+    )
+    contract = px.bar(
+        contract_data,
+        x="contract_type",
+        y="n",
+        color="status",
+        color_discrete_map=STATUS_COLOR,
+        category_orders={"contract_type": ["Bulanan", "Tahunan", "Dua Tahun"]},
+        template="plotly_white",
+        title="Status churn aktual per jenis kontrak",
+        labels={"contract_type": "", "n": "Pelanggan", "status": "Status"},
+    )
+
+    tenure = px.histogram(
+        filtered,
+        x="tenure_months",
+        color="status",
+        nbins=30,
+        color_discrete_map=STATUS_COLOR,
+        template="plotly_white",
+        title="Distribusi tenure menurut status aktual",
+        labels={"tenure_months": "Tenure (bulan)", "status": "Status"},
+    )
+
+    charges = px.scatter(
+        filtered,
+        x="tenure_months",
+        y="monthly_charges",
+        color="status",
+        hover_name="customer_id",
+        opacity=0.6,
+        color_discrete_map=STATUS_COLOR,
+        template="plotly_white",
+        title="Tenure vs tagihan bulanan",
+        labels={
+            "tenure_months": "Tenure (bulan)",
+            "monthly_charges": "Tagihan bulanan (Rp)",
+            "status": "Status",
+        },
+    )
+    charges.update_yaxes(tickprefix="Rp", tickformat=",.0f")
+
+    table_fields = [field for _, field in RAW_TABLE_FIELDS]
+    return (
+        kpis,
+        donut,
+        region_chart,
+        trend,
+        contract,
+        tenure,
+        charges,
+        RAW_TABLE_COLUMNS,
+        filtered[table_fields].to_dict("records"),
+        f"Data pelanggan — {len(filtered):,} baris",
+    )
+
+
 @app.callback(
     Output("kpi-row", "children"),
     Output("g-donut", "figure"),
@@ -369,17 +514,21 @@ FILTERS = [
     Output("g-contract", "figure"),
     Output("g-risk", "figure"),
     Output("g-actual-pred", "figure"),
+    Output("tbl-risk", "columns"),
     Output("tbl-risk", "data"),
     Output("tbl-title", "children"),
     *FILTERS,
 )
 def update_overview(model_key, region, segment, kontrak, risk, tenure):
-    if model_key not in MODELS:
+    if model_key != NO_MODEL and model_key not in MODELS:
         raise PreventUpdate
     filtered = apply_filters(model_key, region, segment, kontrak, risk, tenure)
     if filtered.empty:
         empty = px.scatter(title="Tidak ada data — longgarkan filter", template="plotly_white")
-        return [kpi("Pelanggan", "0")], empty, empty, empty, empty, empty, empty, [], "Tidak ada data"
+        columns = RAW_TABLE_COLUMNS if model_key == NO_MODEL else TABLE_COLUMNS
+        return [kpi("Pelanggan", "0")], empty, empty, empty, empty, empty, empty, columns, [], "Tidak ada data"
+    if model_key == NO_MODEL:
+        return actual_overview(filtered)
 
     high_risk = filtered["risk_category"].eq("Tinggi")
     kpis = [
@@ -520,7 +669,8 @@ def update_overview(model_key, region, segment, kontrak, risk, tenure):
         contract,
         risk_distribution,
         actual_pred,
-        top.to_dict("records"),
+        TABLE_COLUMNS,
+        top[[field for _, field in TABLE_FIELDS]].to_dict("records"),
         title,
     )
 
@@ -542,8 +692,12 @@ def update_overview(model_key, region, segment, kontrak, risk, tenure):
     prevent_initial_call=True,
 )
 def run_prediction(_clicks, model_key, region, segment, contract, payment, service, tenure, monthly, complaints, calls):
-    if not _clicks or model_key not in MODELS:
+    if model_key == NO_MODEL:
+        return html.P("Pilih Model A, B, atau C untuk memprediksi pelanggan."), go.Figure()
+    if model_key not in MODELS:
         raise PreventUpdate
+    if not _clicks:
+        return html.P("Isi form lalu klik tombol."), go.Figure()
     if any(value is None for value in (tenure, monthly, complaints, calls)):
         raise PreventUpdate
 
