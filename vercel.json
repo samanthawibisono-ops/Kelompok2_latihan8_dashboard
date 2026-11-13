@@ -1,0 +1,9 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": "python",
+  "functions": {
+    "app.py": {
+      "includeFiles": "{data/**,sesi8/top3_models_cv_roc_auc/**}"
+    }
+  }
+}

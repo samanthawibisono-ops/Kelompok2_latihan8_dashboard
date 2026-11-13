@@ -21,6 +21,10 @@ Open http://127.0.0.1:8053/.
 
 The dashboard reads `data/customer_churn.csv`, `utils/model_utils.py`, and the saved models in `sesi8/top3_models_cv_roc_auc/`.
 
+## Deploy on Vercel
+
+Import this GitHub repository as a new Vercel project. Select the repository root (`./`) as the Root Directory and **Python** as the Application Preset, then deploy. The root `app.py` exposes the Dash server to Vercel, and `vercel.json` includes the bundled data and model files. No build command, output directory, or environment variables are needed.
+
 ## CSV upload
 
 Use the sidebar to upload a UTF-8 CSV with up to 5,000 customers (10 MB). `data/customer_churn.csv` and `data/new_customers.csv` are example formats. The model feature columns are required; `customer_id`, `signup_date`, `churn`, and `total_charges` are optional. Missing `total_charges` is calculated from tenure and monthly charges.
