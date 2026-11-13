@@ -1,5 +1,8 @@
 """Final customer churn dashboard with EDA, filters, and model inference."""
 
+import base64
+import binascii
+import io
 import json
 import sys
 from pathlib import Path
@@ -7,7 +10,7 @@ from pathlib import Path
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from dash import Dash, Input, Output, State, dash_table, dcc, html
+from dash import Dash, Input, Output, State, ctx, dash_table, dcc, html, no_update
 from dash.exceptions import PreventUpdate
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -49,6 +52,89 @@ RISK_COLOR = {"Rendah": "#55A868", "Sedang": "#DD8452", "Tinggi": "#C44E52"}
 STATUS_COLOR = {"Bertahan": "#4C72B0", "Churn": "#C44E52"}
 TENURE_MIN = int(raw["tenure_months"].min())
 TENURE_MAX = int(raw["tenure_months"].max())
+MAX_UPLOAD_BYTES = 10_000_000
+MAX_UPLOAD_ROWS = 5_000
+
+
+def parse_uploaded_csv(contents, filename):
+    if not filename or not filename.lower().endswith(".csv"):
+        raise ValueError("Pilih file dengan ekstensi .csv.")
+    if not contents or "," not in contents:
+        raise ValueError("Isi file tidak dapat dibaca.")
+    encoded = contents.split(",", 1)[1]
+    if len(encoded) * 3 // 4 > MAX_UPLOAD_BYTES:
+        raise ValueError("Ukuran CSV maksimal 10 MB.")
+    try:
+        decoded = base64.b64decode(encoded, validate=True)
+        frame = pd.read_csv(io.BytesIO(decoded), encoding="utf-8-sig")
+    except (binascii.Error, ValueError, UnicodeError, pd.errors.ParserError) as exc:
+        raise ValueError("CSV harus berformat UTF-8 dan memiliki kolom yang valid.") from exc
+    if frame.empty:
+        raise ValueError("CSV tidak berisi baris pelanggan.")
+    if len(frame) > MAX_UPLOAD_ROWS:
+        raise ValueError(f"CSV maksimal {MAX_UPLOAD_ROWS:,} baris pelanggan.")
+    frame.columns = frame.columns.str.strip()
+    if frame.columns.duplicated().any():
+        raise ValueError("Nama kolom CSV tidak boleh duplikat.")
+
+    required = set(META["feature_order"]) - {"total_charges"}
+    missing = sorted(required - set(frame.columns))
+    if missing:
+        raise ValueError(f"Kolom wajib belum ada: {', '.join(missing)}.")
+
+    for field in META["numeric_features"]:
+        if field == "total_charges" and field not in frame:
+            frame[field] = pd.NA
+        frame[field] = pd.to_numeric(frame[field], errors="coerce")
+    frame["total_charges"] = frame["total_charges"].fillna(
+        frame["monthly_charges"] * frame["tenure_months"]
+    )
+    invalid_numeric = [
+        field for field in META["numeric_features"] if frame[field].isna().any()
+    ]
+    if invalid_numeric:
+        raise ValueError(f"Kolom numerik berisi nilai kosong/tidak valid: {', '.join(invalid_numeric)}.")
+
+    for field in META["categorical_features"]:
+        frame[field] = frame[field].astype("string").str.strip()
+        if frame[field].isna().any() or frame[field].eq("").any():
+            raise ValueError(f"Kolom {field} berisi nilai kosong.")
+    errors = validate_input(frame, META)
+    if errors:
+        raise ValueError(" ".join(errors))
+
+    generated_ids = pd.Series(
+        [f"UPLOAD-{index + 1:05d}" for index in range(len(frame))], index=frame.index
+    )
+    if "customer_id" not in frame:
+        frame["customer_id"] = generated_ids
+    else:
+        frame["customer_id"] = frame["customer_id"].astype("string").str.strip()
+        frame["customer_id"] = frame["customer_id"].where(
+            frame["customer_id"].notna() & frame["customer_id"].ne(""), generated_ids
+        )
+
+    if "signup_date" in frame:
+        dates = pd.to_datetime(frame["signup_date"], errors="coerce")
+        provided = frame["signup_date"].notna() & frame["signup_date"].astype(str).str.strip().ne("")
+        if (provided & dates.isna()).any():
+            raise ValueError("Kolom signup_date berisi tanggal yang tidak valid.")
+        frame["signup_date"] = dates
+    else:
+        frame["signup_date"] = pd.NaT
+    if "churn" in frame:
+        churn = pd.to_numeric(frame["churn"], errors="coerce")
+        if churn.isna().any() or not churn.isin([0, 1]).all():
+            raise ValueError("Kolom churn harus berisi 0 atau 1 di setiap baris.")
+        frame["churn"] = churn.astype(int)
+    else:
+        frame["churn"] = float("nan")
+    frame["status"] = frame["churn"].map({0: "Bertahan", 1: "Churn"}).fillna("Belum diketahui")
+    frame["periode"] = (
+        frame["signup_date"].dt.to_period("Q").astype("string").fillna("")
+    )
+    columns = ["customer_id", "signup_date", *META["feature_order"], "churn", "status", "periode"]
+    return frame[columns]
 
 COLOR = {
     "bg": "#F5F7FB",
@@ -129,6 +215,28 @@ sidebar = html.Div(
         ),
         html.Small(id="model-info", style={"color": COLOR["muted"]}),
         html.Hr(),
+        label("Data CSV"),
+        dcc.Upload(
+            id="upload-csv",
+            children=html.Div("Klik atau tarik file CSV"),
+            accept=".csv",
+            multiple=False,
+            style={
+                "border": "1px dashed #9AA7BD",
+                "borderRadius": "8px",
+                "padding": "16px 8px",
+                "textAlign": "center",
+                "cursor": "pointer",
+            },
+        ),
+        html.Small("Format: customer_churn.csv atau new_customers.csv · maks. 5.000 baris"),
+        html.Div(
+            id="upload-status",
+            children=html.Small(f"Data bawaan: {len(raw):,} pelanggan."),
+            style={"marginTop": "8px"},
+        ),
+        html.Button("Gunakan data bawaan", id="reset-upload", n_clicks=0),
+        html.Hr(),
         label("Region"),
         dcc.Dropdown(id="f-region", options=CATS["region"], multi=True, placeholder="Semua"),
         html.Br(),
@@ -181,6 +289,16 @@ RAW_TABLE_FIELDS = [
     ("Keluhan", "num_complaints"),
     ("Status aktual", "status"),
 ]
+UNLABELED_TABLE_FIELDS = [
+    ("ID", "customer_id"),
+    ("Region", "region"),
+    ("Segmen", "segment"),
+    ("Kontrak", "contract_type"),
+    ("Tenure", "tenure_months"),
+    ("Tagihan bulanan", "monthly_charges"),
+    ("Keluhan", "num_complaints"),
+    ("Panggilan CS", "support_calls"),
+]
 
 
 def table_columns(fields):
@@ -200,6 +318,7 @@ def table_columns(fields):
 
 TABLE_COLUMNS = table_columns(TABLE_FIELDS)
 RAW_TABLE_COLUMNS = table_columns(RAW_TABLE_FIELDS)
+UNLABELED_TABLE_COLUMNS = table_columns(UNLABELED_TABLE_FIELDS)
 
 tab_overview = html.Div(
     [
@@ -313,13 +432,14 @@ app.layout = html.Div(
         "color": COLOR["ink"],
     },
     children=[
+        dcc.Store(id="dataset-store", storage_type="memory"),
         html.Div(
             style={"marginBottom": "12px"},
             children=[
                 html.H2("Customer Churn Intelligence Dashboard", style={"margin": 0}),
                 html.Div(
                     "Pertanyaan bisnis: pelanggan mana yang berisiko churn dan apa yang harus "
-                    "dilakukan? · Data latihan 2023–2025 · Analisis aktual dan prediksi model",
+                    "dilakukan? · Gunakan data bawaan atau unggah CSV pelanggan",
                     style={"color": COLOR["muted"]},
                 ),
             ],
@@ -356,6 +476,49 @@ app.layout = html.Div(
 
 
 @app.callback(
+    Output("dataset-store", "data"),
+    Output("upload-status", "children"),
+    Input("upload-csv", "contents"),
+    Input("reset-upload", "n_clicks"),
+    State("upload-csv", "filename"),
+    prevent_initial_call=True,
+)
+def update_dataset(contents, _reset_clicks, filename):
+    if ctx.triggered_id == "reset-upload":
+        return None, html.Small(f"Data bawaan: {len(raw):,} pelanggan.")
+    if not contents:
+        raise PreventUpdate
+    try:
+        frame = parse_uploaded_csv(contents, filename)
+    except ValueError as exc:
+        return no_update, html.Small(f"Upload gagal: {exc}", style={"color": "crimson"})
+    label_type = "dengan churn aktual" if frame["churn"].notna().any() else "tanpa churn aktual"
+    status = html.Small(f"{filename}: {len(frame):,} pelanggan ({label_type}).")
+    records = json.loads(frame.to_json(orient="records", date_format="iso"))
+    return {"filename": filename, "records": records}, status
+
+
+@app.callback(
+    Output("f-tenure", "min"),
+    Output("f-tenure", "max"),
+    Output("f-tenure", "value"),
+    Output("f-tenure", "marks"),
+    Output("f-region", "value"),
+    Output("f-segment", "value"),
+    Output("f-kontrak", "value"),
+    Output("f-risk", "value"),
+    Input("dataset-store", "data"),
+)
+def update_tenure_range(upload_data):
+    frame = raw if upload_data is None else pd.DataFrame.from_records(upload_data["records"])
+    minimum = int(frame["tenure_months"].min())
+    maximum = max(int(frame["tenure_months"].max()), minimum + 1)
+    middle = (minimum + maximum) // 2
+    marks = {value: str(value) for value in (minimum, middle, maximum)}
+    return minimum, maximum, [minimum, maximum], marks, None, None, CATS["contract_type"], RISK_ORDER
+
+
+@app.callback(
     Output("model-info", "children"),
     Output("risk-filter-container", "style"),
     Output("btn-predict", "disabled"),
@@ -363,7 +526,7 @@ app.layout = html.Div(
 )
 def show_model_info(model_key):
     if model_key == NO_MODEL:
-        return "Analisis churn aktual tanpa prediksi model.", {"display": "none"}, True
+        return "Analisis data pelanggan tanpa prediksi model.", {"display": "none"}, True
     if model_key not in MODEL_CONFIGS:
         raise PreventUpdate
     config = MODEL_CONFIGS[model_key]
@@ -374,8 +537,15 @@ def show_model_info(model_key):
     return info, {}, False
 
 
-def apply_filters(model_key, region, segment, kontrak, risk, tenure):
-    filtered = raw if model_key == NO_MODEL else DF_BY_MODEL[model_key]
+def dataset_for_model(model_key, upload_data):
+    if upload_data is None:
+        return raw if model_key == NO_MODEL else DF_BY_MODEL[model_key]
+    frame = pd.DataFrame.from_records(upload_data["records"])
+    return frame if model_key == NO_MODEL else predict(MODELS[model_key], frame, META)
+
+
+def apply_filters(model_key, region, segment, kontrak, risk, tenure, upload_data=None):
+    filtered = dataset_for_model(model_key, upload_data)
     if region:
         filtered = filtered[filtered["region"].isin(region)]
     if segment:
@@ -393,10 +563,101 @@ FILTERS = [
     Input("f-kontrak", "value"),
     Input("f-risk", "value"),
     Input("f-tenure", "value"),
+    Input("dataset-store", "data"),
 ]
 
 
+def unlabeled_overview(filtered):
+    kpis = [
+        kpi("Pelanggan", f"{len(filtered):,}", "sesuai filter"),
+        kpi("Rata-rata tenure", f"{filtered['tenure_months'].mean():.1f} bulan"),
+        kpi("Rata-rata tagihan bulanan", rupiah(filtered["monthly_charges"].mean())),
+        kpi("Rata-rata keluhan", f"{filtered['num_complaints'].mean():.1f}"),
+    ]
+    segment = px.pie(
+        filtered, names="segment", hole=0.55, title="Komposisi pelanggan per segmen"
+    )
+    regional_counts = filtered.groupby("region", as_index=False).size().sort_values("size")
+    region_chart = px.bar(
+        regional_counts,
+        x="size",
+        y="region",
+        orientation="h",
+        text_auto=True,
+        template="plotly_white",
+        title="Jumlah pelanggan per region",
+        labels={"size": "Pelanggan", "region": ""},
+    )
+    if filtered["periode"].ne("").any():
+        counts = filtered[filtered["periode"].ne("")].groupby("periode", as_index=False).size()
+        trend = px.line(
+            counts,
+            x="periode",
+            y="size",
+            markers=True,
+            template="plotly_white",
+            title="Pelanggan per kuartal pendaftaran",
+            labels={"periode": "Kuartal pendaftaran", "size": "Pelanggan"},
+        )
+    else:
+        service_counts = filtered.groupby("internet_service", as_index=False).size()
+        trend = px.bar(
+            service_counts,
+            x="internet_service",
+            y="size",
+            template="plotly_white",
+            title="Jumlah pelanggan per layanan internet",
+            labels={"internet_service": "Layanan internet", "size": "Pelanggan"},
+        )
+    contract_data = filtered.groupby(["contract_type", "segment"]).size().reset_index(name="n")
+    contract = px.bar(
+        contract_data,
+        x="contract_type",
+        y="n",
+        color="segment",
+        template="plotly_white",
+        title="Pelanggan per kontrak dan segmen",
+        labels={"contract_type": "Jenis kontrak", "n": "Pelanggan", "segment": "Segmen"},
+    )
+    tenure = px.histogram(
+        filtered,
+        x="tenure_months",
+        color="segment",
+        nbins=30,
+        template="plotly_white",
+        title="Distribusi tenure pelanggan",
+        labels={"tenure_months": "Tenure (bulan)", "segment": "Segmen"},
+    )
+    charges = px.scatter(
+        filtered,
+        x="tenure_months",
+        y="monthly_charges",
+        color="segment",
+        hover_name="customer_id",
+        opacity=0.6,
+        template="plotly_white",
+        title="Tenure vs tagihan bulanan",
+        labels={"tenure_months": "Tenure (bulan)", "monthly_charges": "Tagihan bulanan (Rp)"},
+    )
+    charges.update_yaxes(tickprefix="Rp", tickformat=",.0f")
+    table_fields = [field for _, field in UNLABELED_TABLE_FIELDS]
+    return (
+        kpis,
+        segment,
+        region_chart,
+        trend,
+        contract,
+        tenure,
+        charges,
+        UNLABELED_TABLE_COLUMNS,
+        filtered[table_fields].to_dict("records"),
+        f"Data pelanggan tanpa label churn — {len(filtered):,} baris",
+    )
+
+
 def actual_overview(filtered):
+    if not filtered["churn"].notna().any():
+        return unlabeled_overview(filtered)
     churn_count = int(filtered["churn"].sum())
     kpis = [
         kpi("Pelanggan", f"{len(filtered):,}", "sesuai filter"),
@@ -433,16 +694,31 @@ def actual_overview(filtered):
     )
     region_chart.update_xaxes(tickformat=".0%")
 
-    quarterly_churn = filtered.groupby("periode", as_index=False)["churn"].mean()
-    trend = px.line(
-        quarterly_churn,
-        x="periode",
-        y="churn",
-        markers=True,
-        template="plotly_white",
-        title="Churn rate aktual per kuartal pendaftaran",
-        labels={"periode": "Kuartal pendaftaran", "churn": "Churn rate"},
-    )
+    if filtered["periode"].ne("").any():
+        quarterly_churn = (
+            filtered[filtered["periode"].ne("")]
+            .groupby("periode", as_index=False)["churn"]
+            .mean()
+        )
+        trend = px.line(
+            quarterly_churn,
+            x="periode",
+            y="churn",
+            markers=True,
+            template="plotly_white",
+            title="Churn rate aktual per kuartal pendaftaran",
+            labels={"periode": "Kuartal pendaftaran", "churn": "Churn rate"},
+        )
+    else:
+        segment_churn = filtered.groupby("segment", as_index=False)["churn"].mean()
+        trend = px.bar(
+            segment_churn,
+            x="segment",
+            y="churn",
+            template="plotly_white",
+            title="Churn rate aktual per segmen",
+            labels={"segment": "Segmen", "churn": "Churn rate"},
+        )
     trend.update_yaxes(tickformat=".0%")
 
     contract_data = (
@@ -519,10 +795,10 @@ def actual_overview(filtered):
     Output("tbl-title", "children"),
     *FILTERS,
 )
-def update_overview(model_key, region, segment, kontrak, risk, tenure):
+def update_overview(model_key, region, segment, kontrak, risk, tenure, upload_data=None):
     if model_key != NO_MODEL and model_key not in MODELS:
         raise PreventUpdate
-    filtered = apply_filters(model_key, region, segment, kontrak, risk, tenure)
+    filtered = apply_filters(model_key, region, segment, kontrak, risk, tenure, upload_data)
     if filtered.empty:
         empty = px.scatter(title="Tidak ada data — longgarkan filter", template="plotly_white")
         columns = RAW_TABLE_COLUMNS if model_key == NO_MODEL else TABLE_COLUMNS
@@ -530,10 +806,17 @@ def update_overview(model_key, region, segment, kontrak, risk, tenure):
     if model_key == NO_MODEL:
         return actual_overview(filtered)
 
+    has_actual = filtered["churn"].notna().any()
     high_risk = filtered["risk_category"].eq("Tinggi")
+    source_data = raw if upload_data is None else pd.DataFrame.from_records(upload_data["records"])
+    actual_rate = f"{filtered['churn'].mean():.1%}" if has_actual else "—"
+    actual_subtitle = (
+        f"total: {source_data['churn'].mean():.1%}"
+        if has_actual else "Label churn tidak tersedia"
+    )
     kpis = [
         kpi("Pelanggan", f"{len(filtered):,}", "sesuai filter"),
-        kpi("Churn rate aktual", f"{filtered['churn'].mean():.1%}", f"total: {raw['churn'].mean():.1%}"),
+        kpi("Churn rate aktual", actual_rate, actual_subtitle),
         kpi("Rata-rata prob. churn", f"{filtered['churn_probability'].mean():.1%}", "prediksi model"),
         kpi(
             "Risiko tinggi",
@@ -574,21 +857,29 @@ def update_overview(model_key, region, segment, kontrak, risk, tenure):
     )
     region_risk.update_xaxes(tickformat=".0%")
 
-    trend_data = (
-        filtered.groupby("periode")
-        .agg(aktual=("churn", "mean"), prediksi=("churn_probability", "mean"))
-        .reset_index()
+    has_period = filtered["periode"].ne("").any()
+    group_field = "periode" if has_period else "segment"
+    trend_source = filtered[filtered["periode"].ne("")] if has_period else filtered
+    aggregations = {"prediksi": ("churn_probability", "mean")}
+    if has_actual:
+        aggregations["aktual"] = ("churn", "mean")
+    trend_data = trend_source.groupby(group_field).agg(**aggregations).reset_index()
+    trend_long = trend_data.melt(group_field, var_name="seri", value_name="rate")
+    trend_title = (
+        "Churn aktual vs rata-rata prediksi" if has_actual else "Rata-rata prediksi churn"
     )
-    trend = px.line(
-        trend_data.melt("periode", var_name="seri", value_name="rate"),
-        x="periode",
-        y="rate",
-        color="seri",
-        markers=True,
-        template="plotly_white",
-        title="Churn aktual vs rata-rata prediksi per kuartal pendaftaran",
-        labels={"periode": "Kuartal pendaftaran", "rate": "Rate", "seri": ""},
-    )
+    trend_title += " per kuartal pendaftaran" if has_period else " per segmen"
+    trend_labels = {group_field: "Kuartal pendaftaran" if has_period else "Segmen", "rate": "Rate", "seri": ""}
+    if has_period:
+        trend = px.line(
+            trend_long, x=group_field, y="rate", color="seri", markers=True,
+            template="plotly_white", title=trend_title, labels=trend_labels,
+        )
+    else:
+        trend = px.bar(
+            trend_long, x=group_field, y="rate", color="seri", barmode="group",
+            template="plotly_white", title=trend_title, labels=trend_labels,
+        )
     trend.update_yaxes(tickformat=".0%")
 
     contract_data = (
@@ -626,41 +917,57 @@ def update_overview(model_key, region, segment, kontrak, risk, tenure):
         x=META["decision_threshold"], line_dash="dash", annotation_text="threshold"
     )
 
-    actual_pred_data = (
+    regional_prediction = (
         filtered.groupby("region")
-        .agg(
-            aktual=("churn", "mean"),
-            prediksi=("churn_probability", "mean"),
-            n=("customer_id", "count"),
-        )
+        .agg(prediksi=("churn_probability", "mean"), n=("customer_id", "count"))
         .reset_index()
     )
-    actual_pred = px.scatter(
-        actual_pred_data,
-        x="aktual",
-        y="prediksi",
-        size="n",
-        text="region",
-        template="plotly_white",
-        title="Region: churn aktual vs prediksi (ukuran = jumlah pelanggan)",
-        labels={"aktual": "Churn rate aktual", "prediksi": "Rata-rata prediksi"},
-    )
+    if has_actual:
+        actual_by_region = filtered.groupby("region", as_index=False)["churn"].mean()
+        regional_prediction = regional_prediction.merge(
+            actual_by_region.rename(columns={"churn": "aktual"}), on="region"
+        )
+        actual_pred = px.scatter(
+            regional_prediction,
+            x="aktual",
+            y="prediksi",
+            size="n",
+            text="region",
+            template="plotly_white",
+            title="Region: churn aktual vs prediksi (ukuran = jumlah pelanggan)",
+            labels={"aktual": "Churn rate aktual", "prediksi": "Rata-rata prediksi"},
+        )
+        padding = 0.03
+        actual_pred.update_xaxes(
+            tickformat=".0%",
+            range=[regional_prediction["aktual"].min() - padding, regional_prediction["aktual"].max() + padding],
+        )
+    else:
+        actual_pred = px.scatter(
+            regional_prediction,
+            x="n",
+            y="prediksi",
+            size="n",
+            text="region",
+            template="plotly_white",
+            title="Jumlah pelanggan vs rata-rata prediksi per region",
+            labels={"n": "Pelanggan", "prediksi": "Rata-rata prediksi"},
+        )
     actual_pred.update_traces(textposition="top center", cliponaxis=False)
-    padding = 0.03
-    actual_pred.update_xaxes(
-        tickformat=".0%",
-        range=[actual_pred_data["aktual"].min() - padding, actual_pred_data["aktual"].max() + padding],
-    )
     actual_pred.update_yaxes(
         tickformat=".0%",
-        range=[actual_pred_data["prediksi"].min() - padding, actual_pred_data["prediksi"].max() + padding],
+        range=[regional_prediction["prediksi"].min() - 0.03, regional_prediction["prediksi"].max() + 0.03],
     )
 
-    top = filtered.sort_values("churn_probability", ascending=False).head(200)
-    title = (
-        f"Prioritas retensi ({MODEL_LABELS[model_key]}) — "
-        f"{len(top)} pelanggan dengan probabilitas tertinggi"
-    )
+    top = filtered.sort_values("churn_probability", ascending=False)
+    if upload_data is None:
+        top = top.head(200)
+        title = (
+            f"Prioritas retensi ({MODEL_LABELS[model_key]}) — "
+            f"{len(top)} pelanggan dengan probabilitas tertinggi"
+        )
+    else:
+        title = f"Prediksi CSV ({MODEL_LABELS[model_key]}) — {len(top)} pelanggan"
     return (
         kpis,
         donut,
