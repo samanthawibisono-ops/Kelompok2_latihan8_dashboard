@@ -1,5 +1,6 @@
 """Final customer churn dashboard with EDA, filters, and model inference."""
 
+import json
 import sys
 from pathlib import Path
 
@@ -15,22 +16,38 @@ sys.path.append(str(ROOT))
 from utils.model_utils import load_metadata, load_model, predict, validate_input
 
 
-# Data and model are loaded once when the app starts.
-META = load_metadata()
-MODEL = load_model()
+# Load the three saved models once; changing the selector only changes which
+# precomputed predictions the charts read.
+MODEL_DIR = Path(__file__).resolve().parent / "top3_models_cv_roc_auc"
+REGISTRY = json.loads((MODEL_DIR / "top_models_registry.json").read_text(encoding="utf-8"))
+MODEL_CONFIGS = {item["key"]: item for item in REGISTRY["models"]}
+MODEL_OPTIONS = [
+    {"label": f"Model {chr(64 + item['rank'])} — {item['name']}", "value": item["key"]}
+    for item in REGISTRY["models"]
+]
+MODEL_LABELS = {option["value"]: option["label"] for option in MODEL_OPTIONS}
+DEFAULT_MODEL = "logreg_ros"
+META = load_metadata(MODEL_DIR / "model_metadata.json")
+MODELS = {
+    key: load_model(MODEL_DIR / item["file"])
+    for key, item in MODEL_CONFIGS.items()
+}
 raw = pd.read_csv(ROOT / "data" / "customer_churn.csv", parse_dates=["signup_date"])
 raw["total_charges"] = raw["total_charges"].fillna(
     raw["monthly_charges"] * raw["tenure_months"]
 )
-DF = predict(MODEL, raw, META)
-DF["status"] = DF["churn"].map({0: "Bertahan", 1: "Churn"})
-DF["periode"] = DF["signup_date"].dt.to_period("Q").astype(str)
+DF_BY_MODEL = {}
+for model_key, model in MODELS.items():
+    predictions = predict(model, raw, META)
+    predictions["status"] = predictions["churn"].map({0: "Bertahan", 1: "Churn"})
+    predictions["periode"] = predictions["signup_date"].dt.to_period("Q").astype(str)
+    DF_BY_MODEL[model_key] = predictions
 
 CATS = META["categories"]
 RISK_ORDER = ["Rendah", "Sedang", "Tinggi"]
 RISK_COLOR = {"Rendah": "#55A868", "Sedang": "#DD8452", "Tinggi": "#C44E52"}
-TENURE_MIN = int(DF["tenure_months"].min())
-TENURE_MAX = int(DF["tenure_months"].max())
+TENURE_MIN = int(raw["tenure_months"].min())
+TENURE_MAX = int(raw["tenure_months"].max())
 
 COLOR = {
     "bg": "#F5F7FB",
@@ -104,7 +121,13 @@ def chart_card(component_id):
 sidebar = html.Div(
     style={**CARD, "width": "250px", "flexShrink": 0},
     children=[
-        html.H4("Filter", style={"marginTop": 0}),
+        html.H4("Model & Filter", style={"marginTop": 0}),
+        label("Model prediksi"),
+        dcc.Dropdown(
+            id="f-model", options=MODEL_OPTIONS, value=DEFAULT_MODEL, clearable=False
+        ),
+        html.Small(id="model-info", style={"color": COLOR["muted"]}),
+        html.Hr(),
         label("Region"),
         dcc.Dropdown(id="f-region", options=CATS["region"], multi=True, placeholder="Semua"),
         html.Br(),
@@ -127,11 +150,6 @@ sidebar = html.Div(
             value=[TENURE_MIN, TENURE_MAX],
             step=1,
             marks={n: str(n) for n in (TENURE_MIN, 24, 48, TENURE_MAX)},
-        ),
-        html.Hr(),
-        html.Small(
-            f"Model: {META['model_name']} v{META['model_version']}",
-            style={"color": COLOR["muted"]},
         ),
     ],
 )
@@ -273,7 +291,7 @@ app.layout = html.Div(
                 html.H2("Customer Churn Intelligence Dashboard", style={"margin": 0}),
                 html.Div(
                     "Pertanyaan bisnis: pelanggan mana yang berisiko churn dan apa yang harus "
-                    "dilakukan? · Data latihan 2023–2025 · Prediksi dari final trained model",
+                    "dilakukan? · Data latihan 2023–2025 · Prediksi dari model terpilih",
                     style={"color": COLOR["muted"]},
                 ),
             ],
@@ -309,8 +327,19 @@ app.layout = html.Div(
 )
 
 
-def apply_filters(region, segment, kontrak, risk, tenure):
-    filtered = DF
+@app.callback(Output("model-info", "children"), Input("f-model", "value"))
+def show_model_info(model_key):
+    if model_key not in MODEL_CONFIGS:
+        raise PreventUpdate
+    config = MODEL_CONFIGS[model_key]
+    return (
+        f"CV ROC AUC {config['cv_roc_auc']['mean']:.4f} · "
+        f"Recall uji {config['holdout_metrics']['recall']:.1%}"
+    )
+
+
+def apply_filters(model_key, region, segment, kontrak, risk, tenure):
+    filtered = DF_BY_MODEL[model_key]
     if region:
         filtered = filtered[filtered["region"].isin(region)]
     if segment:
@@ -323,6 +352,7 @@ def apply_filters(region, segment, kontrak, risk, tenure):
 
 
 FILTERS = [
+    Input("f-model", "value"),
     Input("f-region", "value"),
     Input("f-segment", "value"),
     Input("f-kontrak", "value"),
@@ -343,8 +373,10 @@ FILTERS = [
     Output("tbl-title", "children"),
     *FILTERS,
 )
-def update_overview(region, segment, kontrak, risk, tenure):
-    filtered = apply_filters(region, segment, kontrak, risk, tenure)
+def update_overview(model_key, region, segment, kontrak, risk, tenure):
+    if model_key not in MODELS:
+        raise PreventUpdate
+    filtered = apply_filters(model_key, region, segment, kontrak, risk, tenure)
     if filtered.empty:
         empty = px.scatter(title="Tidak ada data — longgarkan filter", template="plotly_white")
         return [kpi("Pelanggan", "0")], empty, empty, empty, empty, empty, empty, [], "Tidak ada data"
@@ -352,7 +384,7 @@ def update_overview(region, segment, kontrak, risk, tenure):
     high_risk = filtered["risk_category"].eq("Tinggi")
     kpis = [
         kpi("Pelanggan", f"{len(filtered):,}", "sesuai filter"),
-        kpi("Churn rate aktual", f"{filtered['churn'].mean():.1%}", f"total: {DF['churn'].mean():.1%}"),
+        kpi("Churn rate aktual", f"{filtered['churn'].mean():.1%}", f"total: {raw['churn'].mean():.1%}"),
         kpi("Rata-rata prob. churn", f"{filtered['churn_probability'].mean():.1%}", "prediksi model"),
         kpi(
             "Risiko tinggi",
@@ -476,7 +508,10 @@ def update_overview(region, segment, kontrak, risk, tenure):
     )
 
     top = filtered.sort_values("churn_probability", ascending=False).head(200)
-    title = f"Prioritas retensi — {len(top)} pelanggan dengan probabilitas tertinggi"
+    title = (
+        f"Prioritas retensi ({MODEL_LABELS[model_key]}) — "
+        f"{len(top)} pelanggan dengan probabilitas tertinggi"
+    )
     return (
         kpis,
         donut,
@@ -494,6 +529,7 @@ def update_overview(region, segment, kontrak, risk, tenure):
     Output("pred-output", "children"),
     Output("g-gauge", "figure"),
     Input("btn-predict", "n_clicks"),
+    Input("f-model", "value"),
     State("p-region", "value"),
     State("p-segment", "value"),
     State("p-contract", "value"),
@@ -505,7 +541,9 @@ def update_overview(region, segment, kontrak, risk, tenure):
     State("p-calls", "value"),
     prevent_initial_call=True,
 )
-def run_prediction(_clicks, region, segment, contract, payment, service, tenure, monthly, complaints, calls):
+def run_prediction(_clicks, model_key, region, segment, contract, payment, service, tenure, monthly, complaints, calls):
+    if not _clicks or model_key not in MODELS:
+        raise PreventUpdate
     if any(value is None for value in (tenure, monthly, complaints, calls)):
         raise PreventUpdate
 
@@ -527,7 +565,7 @@ def run_prediction(_clicks, region, segment, contract, payment, service, tenure,
     if errors:
         return html.Div([html.P(error, style={"color": "crimson"}) for error in errors]), px.scatter()
 
-    result = predict(MODEL, row, META).iloc[0]
+    result = predict(MODELS[model_key], row, META).iloc[0]
     recommendations = {
         "Tinggi": "Prioritaskan retensi: hubungi dalam 48 jam, tawarkan kontrak tahunan.",
         "Sedang": "Pantau: kirim survei kepuasan dan penawaran loyalitas.",
@@ -535,6 +573,7 @@ def run_prediction(_clicks, region, segment, contract, payment, service, tenure,
     }
     output = html.Div(
         [
+            html.Div(MODEL_LABELS[model_key], style={"color": COLOR["muted"]}),
             html.Div(
                 f"{result.churn_probability:.1%}",
                 style={
