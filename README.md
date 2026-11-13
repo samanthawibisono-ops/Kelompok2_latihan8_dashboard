@@ -4,7 +4,7 @@ Dash dashboard for customer churn analysis and prediction.
 
 ## Model selector
 
-The default "Tanpa model" option shows actual churn data, raw-data charts, and a customer table without predictions. Choose Model A (Logistic Regression), Model B (Logistic Regression + Random Oversampling), or Model C (Gradient Boosting) to update the risk charts and retention table. Single-customer prediction is available after selecting a model.
+Model C (Gradient Boosting, `churn_model.joblib`) is listed first in the dropdown and selected by default. The "Tanpa model" option shows actual churn data, raw-data charts, and a customer table without predictions. Choose Model A (Logistic Regression), Model B (Logistic Regression + Random Oversampling), or Model C to update the risk charts and retention table. Single-customer prediction is available after selecting a model.
 
 ## Run locally
 

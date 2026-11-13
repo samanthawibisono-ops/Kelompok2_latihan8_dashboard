@@ -25,12 +25,20 @@ MODEL_DIR = Path(__file__).resolve().parent / "top3_models_cv_roc_auc"
 REGISTRY = json.loads((MODEL_DIR / "top_models_registry.json").read_text(encoding="utf-8"))
 MODEL_CONFIGS = {item["key"]: item for item in REGISTRY["models"]}
 NO_MODEL = "none"
-MODEL_OPTIONS = [{"label": "Tanpa model — Data aktual", "value": NO_MODEL}] + [
+# Letters follow the registry rank (A = logreg, B = logreg_ros,
+# C = gradient_boosting / churn_model.joblib). Model C is listed first and
+# selected by default, followed by the raw-data option and the other models.
+DEFAULT_MODEL = "gradient_boosting"
+RANKED_MODEL_OPTIONS = [
     {"label": f"Model {chr(64 + item['rank'])} — {item['name']}", "value": item["key"]}
     for item in REGISTRY["models"]
 ]
+MODEL_OPTIONS = (
+    [option for option in RANKED_MODEL_OPTIONS if option["value"] == DEFAULT_MODEL]
+    + [{"label": "Tanpa model — Data aktual", "value": NO_MODEL}]
+    + [option for option in RANKED_MODEL_OPTIONS if option["value"] != DEFAULT_MODEL]
+)
 MODEL_LABELS = {option["value"]: option["label"] for option in MODEL_OPTIONS}
-DEFAULT_MODEL = NO_MODEL
 META = load_metadata(MODEL_DIR / "model_metadata.json")
 MODELS = {
     key: load_model(MODEL_DIR / item["file"])
