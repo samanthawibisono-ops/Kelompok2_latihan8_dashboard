@@ -571,4 +571,4 @@ def run_prediction(_clicks, region, segment, contract, payment, service, tenure,
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8053)
+    app.run(debug=False, port=8053)
